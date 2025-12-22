@@ -1,0 +1,6 @@
+fileignoreconfig:
+- filename: .github/workflows/deploy-ecs.yml
+  checksum: 584bdbaa6d066be20a2fff451b8fba3ed6c110add67ce87ad4b568d0b0b79ab8
+- filename: README.md
+  checksum: 33c5bb35aa042caeb44dc065417938351c88b32b496cc626facc12c76ac32c4d
+version: ""

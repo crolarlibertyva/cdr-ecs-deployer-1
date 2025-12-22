@@ -1,0 +1,194 @@
+name: Deploy to AWS ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 'Docker image to deploy (e.g., my-repo/my-app:latest)'
+        required: true
+        type: string
+      
+      ecs_cluster:
+        description: 'ECS cluster name'
+        required: true
+        type: string
+      
+      ecs_service:
+        description: 'ECS service name'
+        required: true
+        type: string
+      
+      task_definition_family:
+        description: 'Task definition family name'
+        required: true
+        type: string
+      
+      container_name:
+        description: 'Container name in task definition'
+        required: true
+        type: string
+      
+      cpu:
+        description: 'CPU units (256, 512, 1024, 2048, 4096)'
+        required: false
+        default: '256'
+        type: string
+      
+      memory:
+        description: 'Memory in MB (512, 1024, 2048, 4096, 8192, etc.)'
+        required: false
+        default: '512'
+        type: string
+      
+      environment_variables:
+        description: 'Environment variables in JSON format (e.g., [{"name":"KEY","value":"VALUE"}])'
+        required: false
+        default: '[]'
+        type: string
+      
+      secrets:
+        description: 'Secrets from AWS Secrets Manager or Parameter Store in JSON format (e.g., [{"name":"DB_PASSWORD","valueFrom":"arn:aws:secretsmanager:..."}])'
+        required: false
+        default: '[]'
+        type: string
+      
+      mount_points:
+        description: 'Mount points in JSON format (e.g., [{"sourceVolume":"my-volume","containerPath":"/data","readOnly":false}])'
+        required: false
+        default: '[]'
+        type: string
+      
+      volumes:
+        description: 'Volumes in JSON format (e.g., [{"name":"my-volume","host":{"sourcePath":"/host/path"}}])'
+        required: false
+        default: '[]'
+        type: string
+      
+      aws_region:
+        description: 'AWS region'
+        required: false
+        default: 'us-east-1'
+        type: string
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          # Alternative: Use IAM user credentials instead of OIDC
+          # aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: Get current task definition
+        id: get-task-def
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ inputs.task_definition_family }} \
+            --query 'taskDefinition' \
+            --output json > task-definition.json
+          
+          echo "Retrieved current task definition"
+      
+      - name: Prepare new task definition
+        id: prep-task-def
+        run: |
+          # Read the current task definition
+          TASK_DEF=$(cat task-definition.json)
+          
+          # Parse inputs
+          ENV_VARS='${{ inputs.environment_variables }}'
+          SECRETS='${{ inputs.secrets }}'
+          MOUNT_POINTS='${{ inputs.mount_points }}'
+          VOLUMES='${{ inputs.volumes }}'
+          
+          # Create new task definition with updated values
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq --arg IMAGE "${{ inputs.docker_image }}" \
+            --arg CPU "${{ inputs.cpu }}" \
+            --arg MEMORY "${{ inputs.memory }}" \
+            --arg CONTAINER_NAME "${{ inputs.container_name }}" \
+            --argjson ENV_VARS "$ENV_VARS" \
+            --argjson SECRETS "$SECRETS" \
+            --argjson MOUNT_POINTS "$MOUNT_POINTS" \
+            --argjson VOLUMES "$VOLUMES" \
+            '
+            .cpu = $CPU |
+            .memory = $MEMORY |
+            .containerDefinitions = [
+              .containerDefinitions[] | 
+              if .name == $CONTAINER_NAME then
+                .image = $IMAGE |
+                .cpu = ($CPU | tonumber) |
+                .memory = ($MEMORY | tonumber) |
+                .environment = $ENV_VARS |
+                .secrets = $SECRETS |
+                .mountPoints = $MOUNT_POINTS
+              else
+                .
+              end
+            ] |
+            if ($VOLUMES | length) > 0 then
+              .volumes = $VOLUMES
+            else
+              .
+            end |
+            # Remove fields that shouldn't be in the registration request
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            ')
+          
+          # Save the new task definition
+          echo "$NEW_TASK_DEF" > new-task-definition.json
+          
+          echo "New task definition prepared"
+          cat new-task-definition.json
+      
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          # Register the new task definition
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "task_definition_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          echo "Registered new task definition: $TASK_DEF_ARN"
+      
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ inputs.ecs_cluster }} \
+            --service ${{ inputs.ecs_service }} \
+            --task-definition ${{ steps.register-task-def.outputs.task_definition_arn }} \
+            --force-new-deployment
+          
+          echo "ECS service updated with new task definition"
+      
+      - name: Wait for service stability
+        run: |
+          echo "Waiting for service to reach stable state..."
+          aws ecs wait services-stable \
+            --cluster ${{ inputs.ecs_cluster }} \
+            --services ${{ inputs.ecs_service }}
+          
+          echo "Service deployment completed successfully!"
+      
+      - name: Get deployment status
+        if: always()
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ inputs.ecs_cluster }} \
+            --services ${{ inputs.ecs_service }} \
+            --query 'services[0].{ServiceName:serviceName,Status:status,DesiredCount:desiredCount,RunningCount:runningCount,Deployments:deployments}' \
+            --output table
