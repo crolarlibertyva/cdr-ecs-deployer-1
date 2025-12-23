@@ -69,6 +69,53 @@ on:
         required: false
         default: 'us-east-1'
         type: string
+      
+      desired_count:
+        description: 'Number of ECS tasks to run'
+        required: false
+        type: number
+      
+      enable_autoscaling:
+        description: 'Enable auto-scaling for the ECS service'
+        required: false
+        default: false
+        type: boolean
+      
+      min_capacity:
+        description: 'Minimum number of tasks for auto-scaling'
+        required: false
+        default: 1
+        type: number
+      
+      max_capacity:
+        description: 'Maximum number of tasks for auto-scaling'
+        required: false
+        default: 10
+        type: number
+      
+      target_cpu_utilization:
+        description: 'Target CPU utilization percentage for scale up/down (0-100)'
+        required: false
+        default: 70
+        type: number
+      
+      target_memory_utilization:
+        description: 'Target memory utilization percentage for scale up/down (0-100)'
+        required: false
+        default: 80
+        type: number
+      
+      scale_in_cooldown:
+        description: 'Cooldown period in seconds after scale-in activity'
+        required: false
+        default: 300
+        type: number
+      
+      scale_out_cooldown:
+        description: 'Cooldown period in seconds after scale-out activity'
+        required: false
+        default: 60
+        type: number
 
 permissions:
   id-token: write   # Required for OIDC
@@ -167,13 +214,75 @@ jobs:
       
       - name: Update ECS service
         run: |
-          aws ecs update-service \
-            --cluster ${{ inputs.ecs_cluster }} \
-            --service ${{ inputs.ecs_service }} \
-            --task-definition ${{ steps.register-task-def.outputs.task_definition_arn }} \
-            --force-new-deployment
+          # Build the update-service command
+          UPDATE_CMD="aws ecs update-service --cluster ${{ inputs.ecs_cluster }} --service ${{ inputs.ecs_service }} --task-definition ${{ steps.register-task-def.outputs.task_definition_arn }} --force-new-deployment"
+          
+          # Add desired count if provided
+          if [ -n "${{ inputs.desired_count }}" ]; then
+            UPDATE_CMD="$UPDATE_CMD --desired-count ${{ inputs.desired_count }}"
+            echo "Setting desired count to ${{ inputs.desired_count }}"
+          fi
+          
+          # Execute the command
+          eval $UPDATE_CMD
           
           echo "ECS service updated with new task definition"
+      
+      - name: Configure auto-scaling
+        if: ${{ inputs.enable_autoscaling == true }}
+        run: |
+          SERVICE_NAME="${{ inputs.ecs_service }}"
+          CLUSTER_NAME="${{ inputs.ecs_cluster }}"
+          RESOURCE_ID="service/${CLUSTER_NAME}/${SERVICE_NAME}"
+          
+          echo "Configuring auto-scaling for ${RESOURCE_ID}..."
+          
+          # Register scalable target
+          aws application-autoscaling register-scalable-target \
+            --service-namespace ecs \
+            --resource-id "${RESOURCE_ID}" \
+            --scalable-dimension ecs:service:DesiredCount \
+            --min-capacity ${{ inputs.min_capacity }} \
+            --max-capacity ${{ inputs.max_capacity }}
+          
+          echo "Scalable target registered (min: ${{ inputs.min_capacity }}, max: ${{ inputs.max_capacity }})"
+          
+          # Create CPU-based scaling policy
+          aws application-autoscaling put-scaling-policy \
+            --service-namespace ecs \
+            --resource-id "${RESOURCE_ID}" \
+            --scalable-dimension ecs:service:DesiredCount \
+            --policy-name "${SERVICE_NAME}-cpu-scaling" \
+            --policy-type TargetTrackingScaling \
+            --target-tracking-scaling-policy-configuration "{
+              \"TargetValue\": ${{ inputs.target_cpu_utilization }},
+              \"PredefinedMetricSpecification\": {
+                \"PredefinedMetricType\": \"ECSServiceAverageCPUUtilization\"
+              },
+              \"ScaleOutCooldown\": ${{ inputs.scale_out_cooldown }},
+              \"ScaleInCooldown\": ${{ inputs.scale_in_cooldown }}
+            }"
+          
+          echo "CPU-based scaling policy created (target: ${{ inputs.target_cpu_utilization }}%)"
+          
+          # Create Memory-based scaling policy
+          aws application-autoscaling put-scaling-policy \
+            --service-namespace ecs \
+            --resource-id "${RESOURCE_ID}" \
+            --scalable-dimension ecs:service:DesiredCount \
+            --policy-name "${SERVICE_NAME}-memory-scaling" \
+            --policy-type TargetTrackingScaling \
+            --target-tracking-scaling-policy-configuration "{
+              \"TargetValue\": ${{ inputs.target_memory_utilization }},
+              \"PredefinedMetricSpecification\": {
+                \"PredefinedMetricType\": \"ECSServiceAverageMemoryUtilization\"
+              },
+              \"ScaleOutCooldown\": ${{ inputs.scale_out_cooldown }},
+              \"ScaleInCooldown\": ${{ inputs.scale_in_cooldown }}
+            }"
+          
+          echo "Memory-based scaling policy created (target: ${{ inputs.target_memory_utilization }}%)"
+          echo "Auto-scaling configuration completed!"
       
       - name: Wait for service stability
         run: |

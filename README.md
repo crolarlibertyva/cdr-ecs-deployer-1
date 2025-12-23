@@ -33,6 +33,13 @@ Required IAM permissions:
         "ecs:RegisterTaskDefinition",
         "ecs:UpdateService",
         "ecs:DescribeServices",
+        "application-autoscaling:RegisterScalableTarget",
+        "application-autoscaling:PutScalingPolicy",
+        "application-autoscaling:DescribeScalableTargets",
+        "application-autoscaling:DescribeScalingPolicies",
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:DeleteAlarms",
         "iam:PassRole"
       ],
       "Resource": "*"
@@ -78,6 +85,35 @@ Go to Actions → Deploy to AWS ECS → Run workflow
   - Must be compatible with CPU setting (see AWS documentation)
 
 - **aws_region**: AWS region (default: `us-east-1`)
+
+- **desired_count**: Number of ECS tasks to run (optional)
+  - If not specified, keeps the current desired count
+  - Example: `2` (runs 2 instances of the task)
+
+- **enable_autoscaling**: Enable auto-scaling for the ECS service (default: `false`)
+  - Set to `true` to configure auto-scaling policies
+
+- **min_capacity**: Minimum number of tasks for auto-scaling (default: `1`)
+  - Only used when `enable_autoscaling` is `true`
+
+- **max_capacity**: Maximum number of tasks for auto-scaling (default: `10`)
+  - Only used when `enable_autoscaling` is `true`
+
+- **target_cpu_utilization**: Target CPU utilization percentage (default: `70`)
+  - Auto-scales to maintain this CPU usage (0-100)
+  - Only used when `enable_autoscaling` is `true`
+
+- **target_memory_utilization**: Target memory utilization percentage (default: `80`)
+  - Auto-scales to maintain this memory usage (0-100)
+  - Only used when `enable_autoscaling` is `true`
+
+- **scale_in_cooldown**: Cooldown period in seconds after scale-in (default: `300`)
+  - Prevents rapid scale-down after scaling in
+  - Only used when `enable_autoscaling` is `true`
+
+- **scale_out_cooldown**: Cooldown period in seconds after scale-out (default: `60`)
+  - Prevents rapid scale-up after scaling out
+  - Only used when `enable_autoscaling` is `true`
 
 - **environment_variables**: Environment variables in JSON array format
   ```json
@@ -147,6 +183,32 @@ ecs_service: my-service
 task_definition_family: my-app
 container_name: my-app-container
 
+# Deployment with fixed task count
+docker_image: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:v1.0.0
+ecs_cluster: production-cluster
+ecs_service: api-service
+task_definition_family: api-task
+container_name: api-container
+cpu: "1024"
+memory: "2048"
+desired_count: 3
+
+# Deployment with auto-scaling
+docker_image: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:v1.0.0
+ecs_cluster: production-cluster
+ecs_service: api-service
+task_definition_family: api-task
+container_name: api-container
+cpu: "1024"
+memory: "2048"
+enable_autoscaling: true
+min_capacity: 2
+max_capacity: 20
+target_cpu_utilization: 70
+target_memory_utilization: 80
+scale_in_cooldown: 300
+scale_out_cooldown: 60
+
 # Full deployment with all options
 docker_image: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:v1.0.0
 ecs_cluster: production-cluster
@@ -155,6 +217,7 @@ task_definition_family: api-task
 container_name: api-container
 cpu: "1024"
 memory: "2048"
+desired_count: 3
 environment_variables: '[{"name":"NODE_ENV","value":"production"},{"name":"LOG_LEVEL","value":"info"}]'
 secrets: '[{"name":"DB_PASSWORD","valueFrom":"arn:aws:secretsmanager:us-east-1:123456789:secret:prod-db-pass"}]'
 mount_points: '[{"sourceVolume":"data-volume","containerPath":"/app/data","readOnly":false}]'
@@ -187,3 +250,6 @@ Valid combinations for Fargate:
 - A new task definition revision is created on each deployment
 - The workflow waits for the service to reach a stable state before completing
 - Failed deployments will not break the workflow; check the deployment status in the final step
+- **Auto-scaling**: When enabled, creates both CPU and memory-based target tracking policies. The service will scale up/down to maintain the target utilization levels
+- **Task count**: If both `desired_count` and `enable_autoscaling` are specified, the desired count is set first, then auto-scaling policies are applied
+- **Cooldown periods**: Scale-out cooldown is typically shorter (60s) to respond quickly to increased load, while scale-in cooldown is longer (300s) to avoid rapid scale-down during temporary dips
