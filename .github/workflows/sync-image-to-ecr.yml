@@ -1,0 +1,137 @@
+name: Sync Image to ECR
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_image:
+        description: 'Source image URI (e.g., containers.va.ghe.com/software/cdr-charon:tag)'
+        required: true
+        type: string
+      
+      destination_repo:
+        description: 'Destination ECR repository (e.g., cdr-charon)'
+        required: false
+        default: 'cdr-charon'
+        type: string
+      
+      aws_region:
+        description: 'AWS region'
+        required: false
+        default: 'us-gov-west-1'
+        type: string
+  
+  registry_package:
+    types: [published]
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+  packages: read    # Required to pull from container registry
+
+jobs:
+  sync-image:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Determine image source and tag
+        id: image-info
+        run: |
+          if [ "${{ github.event_name }}" == "registry_package" ]; then
+            # Extract image info from registry_package event
+            SOURCE_IMAGE="${{ github.event.registry_package.package_version.container_metadata.image.url }}"
+            SOURCE_TAG="${{ github.event.registry_package.package_version.container_metadata.image.tag }}"
+          else
+            # Use workflow_dispatch inputs
+            SOURCE_IMAGE="${{ inputs.source_image }}"
+            # Extract tag from source image if it contains one
+            if [[ "$SOURCE_IMAGE" == *":"* ]]; then
+              SOURCE_TAG="${SOURCE_IMAGE##*:}"
+              SOURCE_IMAGE="${SOURCE_IMAGE%:*}"
+            else
+              SOURCE_TAG="latest"
+            fi
+          fi
+          
+          # Set outputs
+          echo "source_image=$SOURCE_IMAGE" >> $GITHUB_OUTPUT
+          echo "source_tag=$SOURCE_TAG" >> $GITHUB_OUTPUT
+          
+          echo "Source image: $SOURCE_IMAGE:$SOURCE_TAG"
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region || 'us-gov-west-1' }}
+          # Alternative: Use IAM user credentials instead of OIDC
+          # aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: Login to AWS ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: private
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: containers.va.ghe.com
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Pull image from source registry
+        env:
+          SOURCE_IMAGE: ${{ steps.image-info.outputs.source_image }}
+          SOURCE_TAG: ${{ steps.image-info.outputs.source_tag }}
+        run: |
+          echo "Pulling image: $SOURCE_IMAGE:$SOURCE_TAG"
+          docker pull "$SOURCE_IMAGE:$SOURCE_TAG"
+      
+      - name: Push image to AWS ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.destination_repo || 'cdr-charon' }}
+          IMAGE_TAG: ${{ steps.image-info.outputs.source_tag }}
+          SOURCE_IMAGE: ${{ steps.image-info.outputs.source_image }}
+          SOURCE_TAG: ${{ steps.image-info.outputs.source_tag }}
+        run: |
+          # Tag the pulled image for ECR
+          docker tag "$SOURCE_IMAGE:$SOURCE_TAG" "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
+          # Also push as latest if it's the main branch or release
+          if [ "${{ github.ref }}" == "refs/heads/main" ] || [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            docker tag "$SOURCE_IMAGE:$SOURCE_TAG" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          fi
+          
+          # Push all tagged images
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
+          if [ "${{ github.ref }}" == "refs/heads/main" ] || [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          fi
+          
+          echo "Image successfully pushed to ECR"
+          echo "- $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
+          if [ "${{ github.ref }}" == "refs/heads/main" ] || [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "- $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          fi
+      
+      - name: Log image details
+        if: always()
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.destination_repo || 'cdr-charon' }}
+          IMAGE_TAG: ${{ steps.image-info.outputs.source_tag }}
+        run: |
+          echo "Image sync summary:"
+          echo "  Source: ${{ steps.image-info.outputs.source_image }}:${{ steps.image-info.outputs.source_tag }}"
+          echo "  Destination: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "  AWS Region: ${{ inputs.aws_region || 'us-gov-west-1' }}"
